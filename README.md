@@ -163,6 +163,34 @@ needs — no installs, no SIM card, just a laptop with a mic and a browser.
   capability is on) — if it's off, sends fail with a clear error. No
   extra env vars needed; `/api/sms` and `/api/messages` reuse the same
   credentials as everything else.
+- **App icon** — a custom icon (a phone glyph on the same near-black/crimson
+  brand gradient) is wired up for the browser tab, iOS/Android "Add to
+  Home Screen," and Chrome's install prompt. Installed from the home
+  screen, it opens full-screen with no browser address bar, like a real
+  app.
+- **Face ID / Touch ID / Windows Hello** — on a browser and device that
+  supports a platform authenticator, the lock screen offers "Unlock with
+  Face ID / Touch ID" as an alternative to typing the access code every
+  time. This is real WebAuthn (passkey) authentication via
+  `@simplewebauthn/server` and `@simplewebauthn/browser` — not a password
+  autofill shim:
+  - **Setup**: unlock normally with the access code once, then click
+    **"+ Add this device"** near the bottom of the dialer card. That
+    registers a credential tied to this specific browser/device's secure
+    enclave.
+  - **After that**: the lock screen shows the Face ID/Touch ID button
+    first, with the access code as a fallback below it.
+  - **Under the hood**: registering a new credential still requires the
+    real access code (so a stranger who finds the URL can't register
+    their own face as a backdoor). Signing in with a registered
+    credential does not — the verified biometric signature itself is the
+    proof, and on success the server hands back the real access code,
+    which the app then uses exactly as if it had been typed.
+  - **Managing devices**: the same "Face ID / Touch ID" section lists every
+    registered device with a remove button, in case a device is lost or
+    no longer used.
+  - Credentials are stored in the same Twilio Sync Service as the Phone
+    Book (a new document, `webauthn_credentials`) — no new env vars.
 
 ### Heads up: Twilio's default SMS auto-reply
 
@@ -206,6 +234,13 @@ app/
   api/messages/route.ts    Reads/deletes one conversation's message history live from Twilio (polled by the UI)
   api/conversations/route.ts  Reads the list of all conversations, and deletes a whole conversation
   api/contacts/route.ts    Reads/writes the shared Phone Book (stored in Twilio Sync, not per-browser)
+  api/webauthn/register-options/route.ts   Starts registering a Face ID/Touch ID credential (access-code gated)
+  api/webauthn/register-verify/route.ts    Verifies + stores that credential
+  api/webauthn/login-options/route.ts      Starts a biometric sign-in (no access code needed - this replaces it)
+  api/webauthn/login-verify/route.ts       Verifies the biometric signature, returns the real access code on success
+  api/webauthn/devices/route.ts            Lists/removes registered biometric devices (access-code gated)
+  icon.png, apple-icon.png    App icons (Next.js file conventions - browser tab, home screen, install prompt)
+  manifest.ts              Web app manifest so "Add to Home Screen" opens full-screen with no browser chrome
 lib/
   auth.ts                  Shared access-code verification (used by every /api route above)
   constants.ts             Shared agent identity string
@@ -213,6 +248,8 @@ lib/
   rateLimit.ts             In-memory best-effort rate limiter
   contacts.ts              Shared Contact type used by api/contacts and the UI
   messageThread.ts         Shared message-thread/conversation types used by the API routes and the UI
+  webauthn.ts              Shared WebAuthn types + Relying Party config (derived from PUBLIC_BASE_URL)
+  webauthnStore.ts         Reads/writes registered credentials (Twilio Sync, same service as contacts)
 .env.example               Template — copy to .env.local, never commit the real one
 ```
 

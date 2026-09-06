@@ -3,9 +3,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Image from "next/image";
 import type { Call, Device } from "@twilio/voice-sdk";
+import {
+  browserSupportsWebAuthn,
+  platformAuthenticatorIsAvailable,
+  startAuthentication,
+  startRegistration,
+} from "@simplewebauthn/browser";
 import { isValidE164, normalizePhoneNumber } from "@/lib/phone";
 import type { Contact } from "@/lib/contacts";
 import type { ConversationSummary, ThreadMessage } from "@/lib/messageThread";
+import type { PublicCredentialInfo } from "@/lib/webauthn";
 
 // The number clients will see on their caller ID. This is display-only;
 // the number actually used to place the call is TWILIO_PHONE_NUMBER on the
@@ -162,6 +169,19 @@ function CloseIcon({ className }: { className?: string }) {
   );
 }
 
+function FingerprintIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className={className}>
+      <path d="M12 10a2 2 0 0 1 2 2c0 2.8-.6 5-2.5 7" />
+      <path d="M8.5 14.5c.7-1 1-2 1-3.5a2.5 2.5 0 0 1 5 0c0 .3 0 .6-.03.9" />
+      <path d="M5.5 12.5c0-.7.1-1.4.3-2" />
+      <path d="M17.7 16.6c.5-1.5.8-3 .8-4.6a6.5 6.5 0 0 0-11.4-4.3" />
+      <path d="M12 3a9 9 0 0 1 9 9c0 .8-.06 1.5-.2 2.2" />
+      <path d="M3.1 15a9 9 0 0 1-.1-3" />
+    </svg>
+  );
+}
+
 function Shell({ children }: { children: React.ReactNode }) {
   return (
     <div className="relative flex min-h-dvh items-center justify-center overflow-hidden bg-gradient-to-br from-[#F7F2F1] via-white to-[#F5EFEE] px-4 py-8 dark:from-[#0c0d10] dark:via-[#120a0b] dark:to-black">
@@ -253,11 +273,46 @@ async function requestToken(accessCode: string): Promise<{ token: string }> {
   return { token: data.token };
 }
 
+function guessDeviceLabel(): string {
+  if (typeof navigator === "undefined") return "This device";
+  const ua = navigator.userAgent;
+  const platform = /iPhone/.test(ua)
+    ? "iPhone"
+    : /iPad/.test(ua)
+      ? "iPad"
+      : /Macintosh/.test(ua)
+        ? "Mac"
+        : /Android/.test(ua)
+          ? "Android"
+          : /Windows/.test(ua)
+            ? "Windows"
+            : "device";
+  const browser = /Edg\//.test(ua)
+    ? "Edge"
+    : /Chrome\//.test(ua)
+      ? "Chrome"
+      : /Safari\//.test(ua)
+        ? "Safari"
+        : /Firefox\//.test(ua)
+          ? "Firefox"
+          : "browser";
+  return `${browser} on ${platform}`;
+}
+
 export default function Dialer() {
   const [unlocked, setUnlocked] = useState(false);
   const [accessCodeInput, setAccessCodeInput] = useState("");
   const [unlocking, setUnlocking] = useState(false);
   const [lockError, setLockError] = useState<string | null>(null);
+
+  // Whether this browser/device has Face ID, Touch ID, or Windows Hello
+  // available at all - checked once on mount, used to decide whether to
+  // show the biometric option on the lock screen and in device settings.
+  const [biometricSupported, setBiometricSupported] = useState(false);
+  const [biometricBusy, setBiometricBusy] = useState(false);
+  const [registeringDevice, setRegisteringDevice] = useState(false);
+  const [deviceSetupMessage, setDeviceSetupMessage] = useState<string | null>(null);
+  const [devices, setDevices] = useState<PublicCredentialInfo[]>([]);
 
   const [micPermission, setMicPermission] = useState<MicPermission>("checking");
   const [deviceReady, setDeviceReady] = useState(false);
@@ -455,6 +510,24 @@ export default function Dialer() {
     [refreshDevices],
   );
 
+  // Checked once, regardless of lock state, so the lock screen can offer
+  // the Face ID / Touch ID button and the unlocked screen can offer to
+  // register this device only when the hardware actually supports it.
+  useEffect(() => {
+    if (!browserSupportsWebAuthn()) return;
+    let cancelled = false;
+    platformAuthenticatorIsAvailable()
+      .then((available) => {
+        if (!cancelled) setBiometricSupported(available);
+      })
+      .catch(() => {
+        if (!cancelled) setBiometricSupported(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Proactively ask for microphone access once unlocked, so the user sees a
   // clear status instead of being surprised by the browser prompt mid-call.
   useEffect(() => {
@@ -605,6 +678,137 @@ export default function Dialer() {
     }
   }
 
+  const fetchDevices = useCallback(async () => {
+    const code = sessionStorage.getItem(STORAGE_KEY);
+    if (!code) return;
+    try {
+      const res = await fetch("/api/webauthn/devices", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accessCode: code }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { devices?: PublicCredentialInfo[] };
+      if (res.ok && data.devices) setDevices(data.devices);
+    } catch {
+      // Silent - the list simply refreshes next time it's shown.
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!unlocked || !biometricSupported) return;
+    const timer = setTimeout(() => fetchDevices(), 0);
+    return () => clearTimeout(timer);
+  }, [unlocked, biometricSupported, fetchDevices]);
+
+  // Tries a biometric unlock from the lock screen. Any failure here - the
+  // user cancelling the OS prompt, nothing registered on this device yet,
+  // or a real verification failure - falls back silently to the access
+  // code field rather than showing an alarming error for what is usually
+  // just "I'll type the password instead."
+  async function handleBiometricUnlock() {
+    playTap();
+    setBiometricBusy(true);
+    setLockError(null);
+    try {
+      const optsRes = await fetch("/api/webauthn/login-options", { method: "POST" });
+      const optsData = (await optsRes.json().catch(() => ({}))) as {
+        options?: Parameters<typeof startAuthentication>[0]["optionsJSON"];
+      };
+      if (!optsRes.ok || !optsData.options) throw new Error("Could not start Face ID / Touch ID.");
+
+      const assertion = await startAuthentication({ optionsJSON: optsData.options });
+
+      const verifyRes = await fetch("/api/webauthn/login-verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ response: assertion, expectedChallenge: optsData.options.challenge }),
+      });
+      const verifyData = (await verifyRes.json().catch(() => ({}))) as { accessCode?: string };
+      if (!verifyRes.ok || !verifyData.accessCode) throw new Error("Could not verify.");
+
+      const { token } = await requestToken(verifyData.accessCode);
+      sessionStorage.setItem(STORAGE_KEY, verifyData.accessCode);
+      await setupDevice(token);
+      setUnlocked(true);
+    } catch (err) {
+      console.warn("[webauthn] biometric unlock did not complete:", err);
+    } finally {
+      setBiometricBusy(false);
+    }
+  }
+
+  // Registers this browser's platform authenticator (Face ID / Touch ID /
+  // Windows Hello) as a way to unlock without typing the access code next
+  // time. Requires the code once, up front - see app/api/webauthn/register-options.
+  async function handleEnableBiometric() {
+    playTap();
+    setRegisteringDevice(true);
+    setDeviceSetupMessage(null);
+
+    const accessCode = sessionStorage.getItem(STORAGE_KEY);
+    if (!accessCode) {
+      setRegisteringDevice(false);
+      return;
+    }
+
+    try {
+      const optsRes = await fetch("/api/webauthn/register-options", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accessCode }),
+      });
+      const optsData = (await optsRes.json().catch(() => ({}))) as {
+        options?: Parameters<typeof startRegistration>[0]["optionsJSON"];
+        error?: string;
+      };
+      if (!optsRes.ok || !optsData.options) throw new Error(optsData.error || "Could not start setup.");
+
+      const attestation = await startRegistration({ optionsJSON: optsData.options });
+
+      const verifyRes = await fetch("/api/webauthn/register-verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          accessCode,
+          response: attestation,
+          expectedChallenge: optsData.options.challenge,
+          deviceLabel: guessDeviceLabel(),
+        }),
+      });
+      const verifyData = (await verifyRes.json().catch(() => ({}))) as {
+        verified?: boolean;
+        devices?: PublicCredentialInfo[];
+        error?: string;
+      };
+      if (!verifyRes.ok || !verifyData.verified) throw new Error(verifyData.error || "Could not complete setup.");
+
+      setDevices(verifyData.devices ?? []);
+      setDeviceSetupMessage("Enabled on this device.");
+    } catch (err) {
+      setDeviceSetupMessage(err instanceof Error ? err.message : "Could not enable Face ID / Touch ID.");
+    } finally {
+      setRegisteringDevice(false);
+    }
+  }
+
+  async function handleRemoveDevice(id: string, label: string) {
+    if (!window.confirm(`Remove Face ID / Touch ID access for "${label}"?`)) return;
+    playTap();
+    const accessCode = sessionStorage.getItem(STORAGE_KEY);
+    if (!accessCode) return;
+    try {
+      const res = await fetch("/api/webauthn/devices", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accessCode, id }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { devices?: PublicCredentialInfo[] };
+      if (res.ok && data.devices) setDevices(data.devices);
+    } catch {
+      // Best-effort; the list simply reflects whatever's on the server next time it loads.
+    }
+  }
+
   useEffect(() => {
     return () => {
       stopTimer();
@@ -646,6 +850,8 @@ export default function Dialer() {
     setSmsError(null);
     setMobileMenuOpen(false);
     setContacts([]);
+    setDevices([]);
+    setDeviceSetupMessage(null);
     resetAfterCall();
   }
 
@@ -1107,6 +1313,25 @@ export default function Dialer() {
             Enter your access code to continue
           </p>
 
+          {biometricSupported && (
+            <>
+              <button
+                type="button"
+                onClick={handleBiometricUnlock}
+                disabled={biometricBusy}
+                className={`${PRIMARY_BUTTON_CLASS} flex items-center justify-center gap-2`}
+              >
+                <FingerprintIcon className="h-4 w-4" />
+                {biometricBusy ? "Verifying…" : "Unlock with Face ID / Touch ID"}
+              </button>
+              <div className="my-4 flex items-center gap-3 text-xs text-slate-400 dark:text-slate-500">
+                <div className="h-px flex-1 bg-slate-900/10 dark:bg-white/10" />
+                or enter your access code
+                <div className="h-px flex-1 bg-slate-900/10 dark:bg-white/10" />
+              </div>
+            </>
+          )}
+
           <label htmlFor="accessCode" className="mt-6 block text-sm font-medium text-slate-700 dark:text-slate-300">
             Access Code
           </label>
@@ -1346,6 +1571,48 @@ export default function Dialer() {
               Status: {statusLabel}
             </p>
           </div>
+
+          {biometricSupported && (
+            <div className="mt-4 border-t border-slate-900/5 pt-4 dark:border-white/5">
+              <div className="flex items-center justify-between">
+                <p className="flex items-center gap-1.5 text-xs font-medium text-slate-500 dark:text-slate-400">
+                  <FingerprintIcon className="h-3.5 w-3.5" />
+                  Face ID / Touch ID
+                </p>
+                <button
+                  type="button"
+                  onClick={handleEnableBiometric}
+                  disabled={registeringDevice}
+                  className="text-xs font-medium text-[#C0272D] hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {registeringDevice ? "Adding…" : "+ Add this device"}
+                </button>
+              </div>
+              {deviceSetupMessage && (
+                <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">{deviceSetupMessage}</p>
+              )}
+              {devices.length > 0 && (
+                <div className="mt-2 space-y-1.5">
+                  {devices.map((d) => (
+                    <div
+                      key={d.id}
+                      className="flex items-center justify-between rounded-lg bg-slate-900/5 px-2.5 py-1.5 text-xs dark:bg-white/5"
+                    >
+                      <span className="truncate text-slate-600 dark:text-slate-300">{d.deviceLabel}</span>
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveDevice(d.id, d.deviceLabel)}
+                        className="shrink-0 text-slate-400 transition-colors hover:text-[#C0272D]"
+                        aria-label={`Remove ${d.deviceLabel}`}
+                      >
+                        <TrashIcon className="h-3 w-3" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Phone book panel - desktop only, mobile reaches it via the drawer above */}

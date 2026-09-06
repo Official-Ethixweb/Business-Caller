@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 
@@ -15,6 +15,17 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "Business Caller",
   description: "Browser-based outbound dialer for the business Twilio line.",
+  // Lets "Add to Home Screen" on iOS launch full-screen with our icon and
+  // no Safari chrome, instead of opening as a plain bookmark.
+  appleWebApp: {
+    capable: true,
+    title: "Business Caller",
+    statusBarStyle: "black-translucent",
+  },
+};
+
+export const viewport: Viewport = {
+  themeColor: "#0c0d10",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
