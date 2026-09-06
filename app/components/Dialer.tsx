@@ -20,10 +20,57 @@ import type { PublicCredentialInfo } from "@/lib/webauthn";
 // changes.
 const DISPLAY_CALLER_ID = "+1 (206) 452-3433";
 
-const STORAGE_KEY = "dialer_access_code";
 const MAX_SMS_LENGTH = 1600;
 
 const KEYPAD_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#"];
+
+// The access code is remembered for 14 days, refreshed on every successful
+// login (password or biometric) and every time an already-valid session is
+// found on load - so staying logged in only requires opening the app at
+// least once every 14 days, not 14 days from a single fixed login. Uses
+// localStorage rather than sessionStorage specifically so it survives the
+// browser being closed and reopened.
+const SESSION_KEY = "dialer_session";
+const SESSION_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+
+interface StoredSession {
+  code: string;
+  expiresAt: number;
+}
+
+function saveSession(code: string) {
+  try {
+    const session: StoredSession = { code, expiresAt: Date.now() + SESSION_TTL_MS };
+    localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+  } catch {
+    // Storage can be unavailable (private browsing, quota) - worst case,
+    // the access code is just asked for again next time.
+  }
+}
+
+function loadSession(): string | null {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const session = JSON.parse(raw) as Partial<StoredSession>;
+    if (typeof session.code !== "string" || typeof session.expiresAt !== "number") return null;
+    if (Date.now() > session.expiresAt) {
+      localStorage.removeItem(SESSION_KEY);
+      return null;
+    }
+    return session.code;
+  } catch {
+    return null;
+  }
+}
+
+function clearSession() {
+  try {
+    localStorage.removeItem(SESSION_KEY);
+  } catch {
+    // Nothing to clean up if storage is unavailable.
+  }
+}
 
 type CallStatus = "ready" | "connecting" | "ringing" | "in-call" | "wrapping-up";
 type MicPermission = "checking" | "granted" | "denied";
@@ -301,6 +348,10 @@ function guessDeviceLabel(): string {
 
 export default function Dialer() {
   const [unlocked, setUnlocked] = useState(false);
+  // True only for the brief moment while checking for a remembered
+  // session on load, so a returning user doesn't see the lock screen
+  // flash before being auto-signed-in.
+  const [checkingSession, setCheckingSession] = useState(true);
   const [accessCodeInput, setAccessCodeInput] = useState("");
   const [unlocking, setUnlocking] = useState(false);
   const [lockError, setLockError] = useState<string | null>(null);
@@ -486,7 +537,7 @@ export default function Dialer() {
       const device = new TwilioDevice(token);
 
       device.on("tokenWillExpire", async () => {
-        const savedCode = sessionStorage.getItem(STORAGE_KEY);
+        const savedCode = loadSession();
         if (!savedCode) return;
         try {
           const { token: freshToken } = await requestToken(savedCode);
@@ -509,6 +560,45 @@ export default function Dialer() {
     },
     [refreshDevices],
   );
+
+  // Auto-unlocks on load if a still-valid remembered session exists, so
+  // opening the app doesn't ask for the access code again unless it's been
+  // more than 14 days (or more than 14 days since the last time this ran
+  // successfully - loadSession/saveSession together make it a sliding
+  // window). Runs once on mount, before the lock screen would otherwise render.
+  useEffect(() => {
+    let cancelled = false;
+
+    // Deferred via setTimeout (rather than run directly in the effect body)
+    // so every setState call below - including the early-exit case - never
+    // runs synchronously within this effect's own call stack.
+    const timer = setTimeout(async () => {
+      const savedCode = loadSession();
+      if (!savedCode) {
+        if (!cancelled) setCheckingSession(false);
+        return;
+      }
+
+      try {
+        const { token } = await requestToken(savedCode);
+        if (cancelled) return;
+        saveSession(savedCode);
+        await setupDevice(token);
+        if (!cancelled) setUnlocked(true);
+      } catch {
+        // The remembered code no longer works (e.g. APP_ACCESS_CODE was
+        // rotated) - drop it and fall back to the normal lock screen.
+        clearSession();
+      } finally {
+        if (!cancelled) setCheckingSession(false);
+      }
+    }, 0);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [setupDevice]);
 
   // Checked once, regardless of lock state, so the lock screen can offer
   // the Face ID / Touch ID button and the unlocked screen can offer to
@@ -561,7 +651,7 @@ export default function Dialer() {
   // of any webhook, so polling this endpoint - rather than keeping our own
   // local copy - is what makes a client's reply actually show up here.
   const fetchThread = useCallback(async (number: string) => {
-    const code = sessionStorage.getItem(STORAGE_KEY);
+    const code = loadSession();
     if (!code) return;
     setMessagesLoading(true);
     try {
@@ -601,7 +691,7 @@ export default function Dialer() {
   // it's just an index of who you've talked to, not something that needs
   // second-by-second freshness the way an open thread does.
   const fetchConversations = useCallback(async () => {
-    const code = sessionStorage.getItem(STORAGE_KEY);
+    const code = loadSession();
     if (!code) return;
     setConversationsLoading(true);
     try {
@@ -631,7 +721,7 @@ export default function Dialer() {
   // fetched once on unlock, then re-fetched after every add/delete so this
   // browser's list stays in sync with whatever it just wrote.
   const fetchContacts = useCallback(async () => {
-    const code = sessionStorage.getItem(STORAGE_KEY);
+    const code = loadSession();
     if (!code) return;
     setContactsLoading(true);
     try {
@@ -661,7 +751,7 @@ export default function Dialer() {
   // delete, since the API replaces the whole list rather than patching one
   // entry at a time.
   async function saveContactsToServer(next: Contact[]): Promise<boolean> {
-    const code = sessionStorage.getItem(STORAGE_KEY);
+    const code = loadSession();
     if (!code) return false;
     try {
       const res = await fetch("/api/contacts", {
@@ -679,7 +769,7 @@ export default function Dialer() {
   }
 
   const fetchDevices = useCallback(async () => {
-    const code = sessionStorage.getItem(STORAGE_KEY);
+    const code = loadSession();
     if (!code) return;
     try {
       const res = await fetch("/api/webauthn/devices", {
@@ -727,7 +817,7 @@ export default function Dialer() {
       if (!verifyRes.ok || !verifyData.accessCode) throw new Error("Could not verify.");
 
       const { token } = await requestToken(verifyData.accessCode);
-      sessionStorage.setItem(STORAGE_KEY, verifyData.accessCode);
+      saveSession(verifyData.accessCode);
       await setupDevice(token);
       setUnlocked(true);
     } catch (err) {
@@ -745,7 +835,7 @@ export default function Dialer() {
     setRegisteringDevice(true);
     setDeviceSetupMessage(null);
 
-    const accessCode = sessionStorage.getItem(STORAGE_KEY);
+    const accessCode = loadSession();
     if (!accessCode) {
       setRegisteringDevice(false);
       return;
@@ -794,7 +884,7 @@ export default function Dialer() {
   async function handleRemoveDevice(id: string, label: string) {
     if (!window.confirm(`Remove Face ID / Touch ID access for "${label}"?`)) return;
     playTap();
-    const accessCode = sessionStorage.getItem(STORAGE_KEY);
+    const accessCode = loadSession();
     if (!accessCode) return;
     try {
       const res = await fetch("/api/webauthn/devices", {
@@ -824,7 +914,7 @@ export default function Dialer() {
     setUnlocking(true);
     try {
       const { token } = await requestToken(accessCodeInput);
-      sessionStorage.setItem(STORAGE_KEY, accessCodeInput);
+      saveSession(accessCodeInput);
       await setupDevice(token);
       setUnlocked(true);
     } catch (err) {
@@ -838,7 +928,7 @@ export default function Dialer() {
     playTap();
     deviceRef.current?.destroy();
     deviceRef.current = null;
-    sessionStorage.removeItem(STORAGE_KEY);
+    clearSession();
     setUnlocked(false);
     setDeviceReady(false);
     setAccessCodeInput("");
@@ -978,7 +1068,7 @@ export default function Dialer() {
       return;
     }
 
-    const accessCode = sessionStorage.getItem(STORAGE_KEY);
+    const accessCode = loadSession();
     if (!accessCode) {
       setSmsError("Your session expired. Please sign out and enter the access code again.");
       return;
@@ -1015,7 +1105,7 @@ export default function Dialer() {
       return;
     }
     playTap();
-    const accessCode = sessionStorage.getItem(STORAGE_KEY);
+    const accessCode = loadSession();
     if (!accessCode) return;
     try {
       await fetch("/api/messages", {
@@ -1039,7 +1129,7 @@ export default function Dialer() {
       return;
     }
     playTap();
-    const accessCode = sessionStorage.getItem(STORAGE_KEY);
+    const accessCode = loadSession();
     if (!accessCode) return;
     try {
       await fetch("/api/conversations", {
@@ -1300,6 +1390,17 @@ export default function Dialer() {
       </form>
     </div>
   );
+
+  if (checkingSession) {
+    return (
+      <Shell>
+        <div className={CARD_CLASS}>
+          <Logo />
+          <p className="mt-4 text-center text-sm text-slate-400 dark:text-slate-500">Loading…</p>
+        </div>
+      </Shell>
+    );
+  }
 
   if (!unlocked) {
     return (

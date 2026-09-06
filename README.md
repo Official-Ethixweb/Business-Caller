@@ -130,6 +130,12 @@ needs — no installs, no SIM card, just a laptop with a mic and a browser.
 
 ## Extra features
 
+- **Stays signed in for 14 days** — unlocking (password or Face ID/Touch
+  ID) is remembered in the browser for 14 days, refreshed every time the
+  app is opened while still valid. So in practice, opening it at least
+  once every 14 days keeps it signed in indefinitely; leave it untouched
+  longer than that and it asks to unlock again. Click **Sign out** to end
+  the session immediately regardless of this.
 - **Microphone / speaker picker** — appears above the phone number field.
   Bluetooth headsets show up automatically once paired with the OS; no
   extra setup.
