@@ -874,7 +874,7 @@ export default function Dialer() {
   // referencing them here before their textual definition is fine - what
   // matters is that this sits after all the state/hooks it reads.
   const messagesPanelBody = (
-    <div className={SIDE_PANEL_CLASS}>
+    <div className={`${SIDE_PANEL_CLASS} flex min-h-0 flex-1 flex-col`}>
       <div className="flex items-center gap-2">
         {threadNumber && (
           <button
@@ -912,7 +912,7 @@ export default function Dialer() {
             className={`mt-3 ${COMPACT_INPUT_CLASS}`}
             aria-label="Message recipient"
           />
-          <div className="mt-3 max-h-64 space-y-2 overflow-y-auto">
+          <div className="mt-3 min-h-0 flex-1 space-y-2 overflow-y-auto">
             {conversationsLoading && conversations.length === 0 && (
               <p className="p-2 text-center text-xs text-slate-400 dark:text-slate-500">Loading…</p>
             )}
@@ -959,7 +959,7 @@ export default function Dialer() {
         <>
           <div
             ref={threadScrollRef}
-            className="mt-3 h-64 space-y-2 overflow-y-auto rounded-xl border border-white/40 bg-white/20 p-2 dark:border-white/5 dark:bg-black/10"
+            className="mt-3 min-h-0 flex-1 space-y-2 overflow-y-auto rounded-xl border border-white/40 bg-white/20 p-2 dark:border-white/5 dark:bg-black/10"
           >
             {messageLog.length === 0 && !messagesLoading && (
               <p className="p-2 text-center text-xs text-slate-400 dark:text-slate-500">No messages yet.</p>
@@ -1152,7 +1152,7 @@ export default function Dialer() {
             className="absolute inset-0 bg-black/40 backdrop-blur-sm"
             onClick={() => setMobileMenuOpen(false)}
           />
-          <div className="relative flex h-full w-[88vw] max-w-sm flex-col gap-3 overflow-y-auto border-r border-white/20 bg-[#F7F2F1]/95 p-4 pt-6 backdrop-blur-2xl dark:border-white/5 dark:bg-[#0c0d10]/95">
+          <div className="relative flex h-full w-full flex-col gap-3 border-r border-white/20 bg-[#F7F2F1]/95 p-4 pt-6 backdrop-blur-2xl dark:border-white/5 dark:bg-[#0c0d10]/95">
             <div className="flex items-center justify-between">
               <div className="flex gap-2">
                 <button
@@ -1191,8 +1191,12 @@ export default function Dialer() {
       )}
 
       <div className="flex w-full max-w-6xl flex-col items-center gap-6 lg:flex-row lg:items-start lg:justify-center">
-        {/* Messages panel - desktop only, mobile reaches it via the drawer above */}
-        <div className="order-2 hidden w-full max-w-xs shrink-0 lg:order-1 lg:block">{messagesPanelBody}</div>
+        {/* Messages panel - desktop only, mobile reaches it via the drawer above.
+            Height matches the viewport (minus Shell's py-8) so the thread
+            area fills real screen space instead of a small fixed box. */}
+        <div className="order-2 hidden w-full max-w-xs shrink-0 lg:order-1 lg:flex lg:h-[calc(100dvh-4rem)] lg:flex-col">
+          {messagesPanelBody}
+        </div>
 
         {/* Dialer */}
         <div className={`order-1 mx-auto shrink-0 lg:order-2 ${CARD_CLASS}`}>
